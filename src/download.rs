@@ -15,13 +15,14 @@ use indicatif::ProgressBar;
 use log::debug;
 use sha2::{Digest, Sha256};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::TryFrom;
+use std::fs as stdfs;
+use std::io::Write as _;
 use std::io::SeekFrom;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tempfile::NamedTempFile;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -56,42 +57,80 @@ impl SnapshotDownloader {
     ///   will contain holes that return zeroes when read.
     /// * `progress_bar` is optional, since output to the terminal may not be wanted.
     pub async fn download_to_file<P: AsRef<Path>>(
-        &self,
-        snapshot_id: &str,
-        path: P,
-        progress_bar: Option<ProgressBar>,
-    ) -> Result<()> {
-        let path = path.as_ref();
-        let _ = path
-            .file_name()
-            .context(error::ValidateFileNameSnafu { path })?;
+    &self,
+    snapshot_id: &str,
+    path: P,
+    progress_bar: Option<ProgressBar>,
+) -> Result<()> {
+    self.download_to_file_resume(snapshot_id, path, progress_bar, false)
+        .await
+}
 
-        // Find the overall volume size, the block size, and the metadata we need for each block:
-        // the index, which lets us calculate the offset into the volume; and the token, which we
-        // need to retrieve it.
-        let snapshot: Snapshot = self.list_snapshot_blocks(snapshot_id).await?;
+/// Download a snapshot into the file at the specified path, optionally resuming a partial
+/// download. When `resume` is true and the destination is a normal filesystem file, ColdSnap
+/// will write to a stable partial file `<path>.coldsnap.part` and track completed block indices
+/// in `<path>.coldsnap.state`.
+///
+/// Resume is intentionally **not** supported for block devices.
+pub async fn download_to_file_resume<P: AsRef<Path>>(
+    &self,
+    snapshot_id: &str,
+    path: P,
+    progress_bar: Option<ProgressBar>,
+    resume: bool,
+) -> Result<()> {
+    let path = path.as_ref();
+    let _ = path
+        .file_name()
+        .context(error::ValidateFileNameSnafu { path })?;
 
-        let mut target = if BlockDeviceTarget::is_valid(path).await? {
-            BlockDeviceTarget::new_target(path)?
-        } else {
-            // If not block assume file for now
-            FileTarget::new_target(path)?
-        };
+    // Find the overall volume size, the block size, and the metadata we need for each block:
+    // the index, which lets us calculate the offset into the volume; and the token, which we
+    // need to retrieve it.
+    let snapshot: Snapshot = self.list_snapshot_blocks(snapshot_id).await?;
 
-        debug!("Writing {}G to {}...", snapshot.volume_size, path.display());
-        target.grow(snapshot.volume_size * GIBIBYTE).await?;
-        self.write_snapshot_blocks(snapshot, target.write_path()?, progress_bar)
-            .await?;
-        target.finalize()?;
-
-        Ok(())
+    let is_block_device = BlockDeviceTarget::is_valid(path).await?;
+    if resume && is_block_device {
+        return error::ResumeNotSupportedForBlockDeviceSnafu {
+            path: path.to_path_buf(),
+        }
+        .fail()
+        .map_err(Error::from);
     }
+
+    let resume_state = if resume && !is_block_device {
+        Some(ResumeState::load_or_create(path, &snapshot)?)
+    } else {
+        None
+    };
+
+    let mut target = if is_block_device {
+        BlockDeviceTarget::new_target(path)?
+    } else {
+        // If not block assume file for now
+        FileTarget::new_target(path, resume)?
+    };
+
+    debug!("Writing {}G to {}...", snapshot.volume_size, path.display());
+    target.grow(snapshot.volume_size * GIBIBYTE).await?;
+    self.write_snapshot_blocks(snapshot, target.write_path()?, progress_bar, resume_state)
+        .await?;
+    target.finalize()?;
+
+    // Best-effort cleanup of the resume state file after a successful download.
+    if resume && !is_block_device {
+        let _ = stdfs::remove_file(state_path_for(path));
+    }
+
+    Ok(())
+}
 
     async fn write_snapshot_blocks(
         &self,
         snapshot: Snapshot,
         write_path: &Path,
         progress_bar: Option<ProgressBar>,
+        resume_state: Option<ResumeState>,
     ) -> Result<()> {
         // Collect errors encountered while downloading blocks, since we can't
         // return a result directly through `for_each_concurrent`.
@@ -113,20 +152,46 @@ impl SnapshotDownloader {
             None => Arc::new(None),
         };
 
+
+// Resume support: optionally skip blocks already downloaded.
+let resume_done: Arc<Mutex<HashSet<i32>>> = match resume_state.as_ref() {
+    Some(rs) => Arc::clone(&rs.done),
+    None => Arc::new(Mutex::new(HashSet::new())),
+};
+let resume_append_lock: Option<Arc<Mutex<()>>> =
+    resume_state.as_ref().map(|rs| Arc::clone(&rs.append_lock));
+let resume_state_path: Option<PathBuf> = resume_state.as_ref().map(|rs| rs.state_path.clone());
+
         // Create a context for each block that can be moved to another thread.
         let mut block_contexts = Vec::new();
-        for SnapshotBlock { index, token } in snapshot.blocks {
-            block_contexts.push(BlockContext {
-                path: write_path.to_path_buf(),
-                block_index: index,
-                block_token: token,
-                block_size: snapshot.block_size,
-                snapshot_id: snapshot.snapshot_id.clone(),
-                block_errors: Arc::clone(&block_errors),
-                progress_bar: Arc::clone(&progress_bar),
-                ebs_client: self.ebs_client.clone(),
-            });
+        
+for SnapshotBlock { index, token } in snapshot.blocks {
+    // If resuming, skip blocks we already completed.
+    if resume_state.is_some() {
+        let done = resume_done.lock().expect("poisoned");
+        if done.contains(&index) {
+            if let Some(ref progress_bar) = *progress_bar {
+                progress_bar.inc(1);
+            }
+            continue;
         }
+    }
+
+    block_contexts.push(BlockContext {
+        path: write_path.to_path_buf(),
+        block_index: index,
+        block_token: token,
+        block_size: snapshot.block_size,
+        snapshot_id: snapshot.snapshot_id.clone(),
+        block_errors: Arc::clone(&block_errors),
+        progress_bar: Arc::clone(&progress_bar),
+        ebs_client: self.ebs_client.clone(),
+
+        resume_done: Arc::clone(&resume_done),
+        resume_state_path: resume_state_path.clone(),
+        resume_append_lock: resume_append_lock.clone(),
+    });
+}
 
         // Distribute the work across a fixed number of concurrent workers.
         // New threads will be created by the runtime as needed, but we'll
@@ -334,6 +399,16 @@ impl SnapshotDownloader {
         // Blocks of all zeroes can be omitted from the file.
         let sparse = block_data.iter().all(|&byte| byte == 0u8);
         if sparse {
+            // Even if sparse, mark the block as completed for resume purposes.
+            if let Some(ref state_path) = context.resume_state_path {
+                if let Some(ref lock) = context.resume_append_lock {
+                    let _g = lock.lock().expect("poisoned");
+                    append_done_index(state_path, block_index)?;
+                }
+                let mut done = context.resume_done.lock().expect("poisoned");
+                done.insert(block_index);
+            }
+
             if let Some(ref progress_bar) = *context.progress_bar {
                 progress_bar.inc(1);
             }
@@ -378,6 +453,16 @@ impl SnapshotDownloader {
 
         f.flush().await.context(error::FlushFileSnafu { path })?;
 
+        // Mark completion for resume support.
+        if let Some(ref state_path) = context.resume_state_path {
+            if let Some(ref lock) = context.resume_append_lock {
+                let _g = lock.lock().expect("poisoned");
+                append_done_index(state_path, block_index)?;
+            }
+            let mut done = context.resume_done.lock().expect("poisoned");
+            done.insert(block_index);
+        }
+
         if let Some(ref progress_bar) = *context.progress_bar {
             progress_bar.inc(1);
         }
@@ -410,6 +495,11 @@ struct BlockContext {
     block_errors: Arc<Mutex<BTreeMap<i32, Error>>>,
     progress_bar: Arc<Option<ProgressBar>>,
     ebs_client: EbsClient,
+
+    // Resume support
+    resume_done: Arc<Mutex<HashSet<i32>>>,
+    resume_state_path: Option<PathBuf>,
+    resume_append_lock: Option<Arc<Mutex<()>>>,
 }
 
 /// Shared interface for write targets.
@@ -486,79 +576,168 @@ impl SnapshotWriteTarget for BlockDeviceTarget {
 }
 
 /// Implements file operations for filesystem files.
+///
+/// For atomic writes and resume support, we write blocks into a stable "partial" file
+/// `<final>.coldsnap.part` and then rename it to the final destination on success.
 struct FileTarget {
-    path: PathBuf,
-    temp_file: Option<NamedTempFile>,
+    final_path: PathBuf,
+    part_path: PathBuf,
 }
 
 impl FileTarget {
-    fn new_target<P: AsRef<Path>>(path: P) -> Result<Box<dyn SnapshotWriteTarget>> {
-        let path = path.as_ref();
+    fn new_target<P: AsRef<Path>>(path: P, _resume: bool) -> Result<Box<dyn SnapshotWriteTarget>> {
+        let final_path = path.as_ref().to_path_buf();
+        let part_path = part_path_for(&final_path);
         Ok(Box::new(FileTarget {
-            path: path.into(),
-            temp_file: None,
+            final_path,
+            part_path,
         }))
     }
 }
 
 #[async_trait]
 impl SnapshotWriteTarget for FileTarget {
-    // truncate file to desired size
+    // Create (or reuse) the partial file and extend/truncate it to the desired size.
     async fn grow(&mut self, length: i64) -> Result<()> {
-        let path = self.path.as_path();
+        let path = self.part_path.as_path();
 
-        // Create a temporary file and extend it to the required size.
-        let target_dir = path
-            .parent()
-            .context(error::ValidateParentDirectorySnafu { path })?;
-
-        let temp_file = NamedTempFile::new_in(target_dir)
-            .context(error::CreateTempFileSnafu { path: target_dir })?;
-
-        let temp_file_len = length;
-        let temp_file_len =
-            u64::try_from(temp_file_len).with_context(|_| error::ConvertNumberSnafu {
-                what: "temp file length",
-                number: temp_file_len.to_string(),
+        let file_len =
+            u64::try_from(length).with_context(|_| error::ConvertNumberSnafu {
+                what: "file length",
+                number: length.to_string(),
                 target: "u64",
             })?;
 
-        temp_file
-            .as_file()
-            .set_len(temp_file_len)
-            .context(error::ExtendTempFileSnafu {
-                path: temp_file.as_ref(),
-            })?;
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .await
+            .context(error::OpenFileSnafu { path })?;
 
-        self.temp_file.replace(temp_file);
+        f.set_len(file_len)
+            .await
+            .context(error::ExtendFileSnafu { path })?;
 
         Ok(())
     }
 
     fn write_path(&self) -> Result<&Path> {
-        let write_path = self
-            .temp_file
-            .as_ref()
-            .context(error::MissingTempFileSnafu {})?;
-
-        Ok(write_path.as_ref())
+        Ok(self.part_path.as_path())
     }
 
-    // persist file to destination
+    // Persist file to destination by renaming the partial file into place.
     fn finalize(&mut self) -> Result<()> {
-        let temp_file = self
-            .temp_file
-            .take()
-            .context(error::MissingTempFileSnafu {})?;
-
-        let path = self.path.as_path();
-        temp_file
-            .into_temp_path()
-            .persist(path)
-            .context(error::PersistTempFileSnafu { path })?;
-
+        stdfs::rename(&self.part_path, &self.final_path).context(error::RenamePartFileSnafu {
+            from: self.part_path.clone(),
+            to: self.final_path.clone(),
+        })?;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct ResumeState {
+    state_path: PathBuf,
+    done: Arc<Mutex<HashSet<i32>>>,
+    append_lock: Arc<Mutex<()>>,
+}
+
+fn part_path_for(final_path: &Path) -> PathBuf {
+    let mut p = final_path.as_os_str().to_os_string();
+    p.push(".coldsnap.part");
+    PathBuf::from(p)
+}
+
+fn state_path_for(final_path: &Path) -> PathBuf {
+    let mut p = final_path.as_os_str().to_os_string();
+    p.push(".coldsnap.state");
+    PathBuf::from(p)
+}
+
+impl ResumeState {
+    fn load_or_create(final_path: &Path, snapshot: &Snapshot) -> Result<Self> {
+        let state_path = state_path_for(final_path);
+
+        let (header_ok, done_set) = if state_path.exists() {
+            load_resume_state(&state_path, snapshot)?
+        } else {
+            (false, HashSet::new())
+        };
+
+        if !header_ok {
+            // Create/overwrite with the correct header (fresh resume file).
+            write_resume_header(&state_path, snapshot)?;
+        }
+
+        Ok(ResumeState {
+            state_path,
+            done: Arc::new(Mutex::new(done_set)),
+            append_lock: Arc::new(Mutex::new(())),
+        })
+    }
+}
+
+fn write_resume_header(state_path: &Path, snapshot: &Snapshot) -> std::result::Result<(), error::Error> {
+    let mut f = stdfs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(state_path)
+        .context(error::OpenResumeStateSnafu { path: state_path })?;
+
+    writeln!(
+        f,
+        "coldsnap-resume-v1 snapshot_id={} volume_size={} block_size={}",
+        snapshot.snapshot_id, snapshot.volume_size, snapshot.block_size
+    )
+    .context(error::WriteResumeStateSnafu { path: state_path })?;
+
+    Ok(())
+}
+
+fn load_resume_state(state_path: &Path, snapshot: &Snapshot) -> std::result::Result<(bool, HashSet<i32>), error::Error> {
+    let content = stdfs::read_to_string(state_path)
+        .context(error::ReadResumeStateSnafu { path: state_path })?;
+
+    let mut lines = content.lines();
+    let header = match lines.next() {
+        Some(h) => h,
+        None => return Ok((false, HashSet::new())),
+    };
+
+    let header_ok = header.contains("coldsnap-resume-v1")
+        && header.contains(&format!("snapshot_id={}", snapshot.snapshot_id))
+        && header.contains(&format!("volume_size={}", snapshot.volume_size))
+        && header.contains(&format!("block_size={}", snapshot.block_size));
+
+    if !header_ok {
+        return Ok((false, HashSet::new()));
+    }
+
+    let mut done = HashSet::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(idx) = line.parse::<i32>() {
+            done.insert(idx);
+        }
+    }
+
+    Ok((true, done))
+}
+
+fn append_done_index(state_path: &Path, block_index: i32) -> std::result::Result<(), error::Error> {
+    let mut f = stdfs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_path)
+        .context(error::OpenResumeStateSnafu { path: state_path })?;
+
+    writeln!(f, "{}", block_index).context(error::WriteResumeStateSnafu { path: state_path })?;
+    Ok(())
 }
 
 /// Potential errors while downloading a snapshot and writing to a local file.
@@ -595,29 +774,8 @@ mod error {
         #[snafu(display("Failed to validate file name '{}'", path.display()))]
         ValidateFileName { path: PathBuf },
 
-        #[snafu(display("Failed to find parent directory for file name '{}'", path.display()))]
-        ValidateParentDirectory { path: PathBuf },
-
-        #[snafu(display("Failed to create temporary file in '{}': {}", path.display(), source))]
-        CreateTempFile {
-            path: PathBuf,
-            source: std::io::Error,
-        },
-
-        #[snafu(display("Failed to extend temporary file '{}': {}", path.display(), source))]
-        ExtendTempFile {
-            path: PathBuf,
-            source: std::io::Error,
-        },
-
-        #[snafu(display("Failed to persist temporary file '{}': {}", path.display(), source))]
-        PersistTempFile {
-            path: PathBuf,
-            source: tempfile::PathPersistError,
-        },
-
-        #[snafu(display("Missing temporary file"))]
-        MissingTempFile {},
+        #[snafu(display("Resume is not supported when writing directly to block device '{}'", path.display()))]
+        ResumeNotSupportedForBlockDevice { path: PathBuf },
 
         #[snafu(display("Failed to list snapshot blocks '{snapshot_id}': {source}", source = crate::error_stack(source, 2)))]
         ListSnapshotBlocks {
@@ -736,6 +894,12 @@ mod error {
             source: std::io::Error,
         },
 
+        #[snafu(display("Failed to extend '{}': {}", path.display(), source))]
+        ExtendFile {
+            path: PathBuf,
+            source: std::io::Error,
+        },
+
         #[snafu(display("Failed to seek to {} in '{}': {}", offset, path.display(), source))]
         SeekFileOffset {
             path: PathBuf,
@@ -747,6 +911,31 @@ mod error {
         WriteFileBytes {
             path: PathBuf,
             count: usize,
+            source: std::io::Error,
+        },
+
+        #[snafu(display("Failed to open resume state file '{}': {}", path.display(), source))]
+        OpenResumeState {
+            path: PathBuf,
+            source: std::io::Error,
+        },
+
+        #[snafu(display("Failed to read resume state file '{}': {}", path.display(), source))]
+        ReadResumeState {
+            path: PathBuf,
+            source: std::io::Error,
+        },
+
+        #[snafu(display("Failed to write resume state file '{}': {}", path.display(), source))]
+        WriteResumeState {
+            path: PathBuf,
+            source: std::io::Error,
+        },
+
+        #[snafu(display("Failed to rename partial file '{}' -> '{}': {}", from.display(), to.display(), source))]
+        RenamePartFile {
+            from: PathBuf,
+            to: PathBuf,
             source: std::io::Error,
         },
 

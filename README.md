@@ -77,6 +77,12 @@ Download an EBS snapshot into a local file:
 $ coldsnap download snap-1234 disk.img
 ```
 
+If interruptions are expected, enable `--resume` option (creates <disk>.coldsnap.part and <disk>.coldsnap.state):
+
+```
+$ coldsnap download --resume snap-1234 disk.img
+```
+
 Run `coldsnap --help` to see more options.
 
 ## Installation

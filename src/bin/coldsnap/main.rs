@@ -68,10 +68,11 @@ async fn run() -> Result<()> {
                 download_args.file.display()
             );
             downloader
-                .download_to_file(
+                .download_to_file_resume(
                     &download_args.snapshot_id,
                     &download_args.file,
                     progress_bar?,
+                    download_args.resume,
                 )
                 .await
                 .context(error::DownloadSnapshotSnafu)?;
@@ -279,6 +280,10 @@ struct DownloadArgs {
     #[argh(switch)]
     /// overwrite an existing file
     force: bool,
+
+    #[argh(switch)]
+    /// resume an interrupted download (uses <file>.coldsnap.part and <file>.coldsnap.state)
+    resume: bool,
 
     #[argh(switch)]
     /// disable the progress bar
